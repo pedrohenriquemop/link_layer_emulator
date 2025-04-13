@@ -47,9 +47,13 @@ class DCCNETFrame:
             self.frame_id,
             self.flags,
         )
-        self.checksum = compute_checksum(
-            header_with_zeroed_checksum + bytes(self.data, encoding="ascii")
-        )
+
+        data_as_bytes = bytes(self.data, encoding="ascii")
+
+        if len(data_as_bytes) > MAX_PAYLOAD:
+            raise ValueError("Data exceeds maximum payload size")
+
+        self.checksum = compute_checksum(header_with_zeroed_checksum + data_as_bytes)
         header = struct.pack(
             "!IIHHHB",
             self.sync,
@@ -59,7 +63,7 @@ class DCCNETFrame:
             self.frame_id,
             self.flags,
         )
-        return header + bytes(self.data, encoding="ascii")
+        return header + data_as_bytes
 
     @classmethod
     def unpack(cls, frame_bytes):

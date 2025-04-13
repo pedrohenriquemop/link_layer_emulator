@@ -1,5 +1,5 @@
 import unittest
-from tp1 import DCCNETFrame, compute_checksum, SYNC_BYTES, SYNC, FLAG_END
+from tp1 import DCCNETFrame, compute_checksum, SYNC_BYTES, FLAG_END, MAX_PAYLOAD
 
 
 class TestDCCNET(unittest.TestCase):
@@ -59,6 +59,21 @@ class TestDCCNET(unittest.TestCase):
             length=len(payload), frame_id=0, flags=0x00, data=payload.decode("latin1")
         )
         self.assertRaises(UnicodeEncodeError, frame.pack)
+
+    def test_binary_data_payload_exceeding_limit(self):
+        payload = "a" * (MAX_PAYLOAD + 1)
+        frame = DCCNETFrame(length=len(payload), frame_id=0, flags=0x00, data=payload)
+        self.assertRaises(ValueError, frame.pack)
+
+        payload = "a" * (MAX_PAYLOAD)
+        frame = DCCNETFrame(length=len(payload), frame_id=0, flags=0x00, data=payload)
+        packed = frame.pack()
+        unpacked = DCCNETFrame.unpack(packed)
+
+        self.assertIsNotNone(unpacked)
+        self.assertEqual(unpacked.length, MAX_PAYLOAD)
+        self.assertEqual(unpacked.flags, 0x00)
+        self.assertEqual(unpacked.data, b"a" * MAX_PAYLOAD)
 
 
 if __name__ == "__main__":
