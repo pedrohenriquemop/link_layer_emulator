@@ -54,7 +54,7 @@ class DCCNETFrame:
             self.flags,
         )
 
-        data_as_bytes = bytes(self.data, encoding="ascii")
+        data_as_bytes = bytes(self.data, encoding="ascii") if self.data else b""
 
         if len(data_as_bytes) > MAX_PAYLOAD:
             raise ValueError("Data exceeds maximum payload size")

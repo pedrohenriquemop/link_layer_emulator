@@ -1,5 +1,12 @@
 import unittest
-from tp1 import DCCNETFrame, compute_checksum, SYNC_BYTES, FLAG_END, MAX_PAYLOAD
+from tp1 import (
+    DCCNETFrame,
+    compute_checksum,
+    SYNC_BYTES,
+    FLAG_END,
+    FLAG_ACK,
+    MAX_PAYLOAD,
+)
 
 
 class TestDCCNET(unittest.TestCase):
@@ -74,6 +81,18 @@ class TestDCCNET(unittest.TestCase):
         self.assertEqual(unpacked.length, MAX_PAYLOAD)
         self.assertEqual(unpacked.flags, 0x00)
         self.assertEqual(unpacked.data, b"a" * MAX_PAYLOAD)
+
+    def test_with_no_data_payload_sent(self):
+        # Simulate an ACK frame with no payload (length = 0)
+        frame = DCCNETFrame(length=0, frame_id=0, flags=FLAG_ACK)
+        packed = frame.pack()
+        unpacked = DCCNETFrame.unpack(packed)
+
+        self.assertIsNotNone(unpacked)
+        self.assertEqual(unpacked.length, 0)
+        self.assertEqual(unpacked.frame_id, 0)
+        self.assertEqual(unpacked.flags, FLAG_ACK)
+        self.assertEqual(unpacked.data, b"")
 
 
 if __name__ == "__main__":
