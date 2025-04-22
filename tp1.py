@@ -3,8 +3,9 @@ import socket
 import hashlib
 import os
 import time
+import argparse
 from dotenv import load_dotenv
-from enum import Enum
+from enum import IntEnum
 from typing import Optional
 
 # App Constants
@@ -20,7 +21,7 @@ CONNECTION_MAX_RETRIES = RETRY_LIMIT
 
 
 # Flags
-class Flags(Enum):
+class Flags(IntEnum):
     FLAG_ACK = 0x80
     FLAG_END = 0x40
     FLAG_RST = 0x20
@@ -120,7 +121,7 @@ class DCCNETTransmitter:
         ack_frame = DCCNETFrame(
             length=0,
             frame_id=frame_id,
-            flags=Flags.FLAG_ACK.value,
+            flags=Flags.FLAG_ACK,
         )
         self.send_frame(ack_frame)
 
@@ -247,7 +248,7 @@ class DCCNETEmulator:
                 if response_frame is None:
                     print("No response received")
                     continue
-                if response_frame.flags & Flags.FLAG_ACK.value:
+                if response_frame.flags & Flags.FLAG_ACK:
                     if response_frame.frame_id == frame.frame_id:
                         print(f"ACK received for frame [{frame.frame_id}]")
                         ack_received = True
@@ -282,14 +283,14 @@ class DCCNETEmulator:
                     print("No frame found, SYNC failed.")
                     break
 
-                if frame.flags & Flags.FLAG_ACK.value:
+                if frame.flags & Flags.FLAG_ACK:
                     print("ACK frame received out of order")
                     continue
-                elif frame.flags & Flags.FLAG_RST.value:
+                elif frame.flags & Flags.FLAG_RST:
                     print("Reset frame received. Shutting down connection.")
                     self.stop_flag = True
                     break
-                elif frame.flags & Flags.FLAG_END.value:
+                elif frame.flags & Flags.FLAG_END:
                     print("End frame received. For now, will be treated as a data one.")
                     self.stop_flag = True
                 else:
@@ -348,7 +349,7 @@ class DCCNETEmulator:
     #                     frame = DCCNETFrame(
     #                         length=0,
     #                         frame_id=self.current_frame_id,
-    #                         flags=Flags.FLAG_END.value,
+    #                         flags=Flags.FLAG_END,
     #                     )
     #                     self.send_frame_with_retransmit(frame)
     #                     break
@@ -364,15 +365,53 @@ class DCCNETEmulator:
     #                 self.current_frame_id = 1 - self.current_frame_id
 
 
-if __name__ == "__main__":
-    load_dotenv(".env")
+def parse_address(ip_port: str):
+    if ":" not in ip_port:
+        raise ValueError("Expected format <IP>:<PORT>")
+    ip, port = ip_port.split(":", 1)
+    return ip, int(port)
 
-    # TODO: process args
-    emulator = DCCNETEmulator(
-        os.getenv("SERVER_ADDRESS_NAME"),
-        int(os.getenv("PORT")),
-        gas=os.getenv("GAS"),
-        mode="md5",
+
+def main():
+    parser = argparse.ArgumentParser(description="DCCNET Emulator CLI")
+    group = parser.add_mutually_exclusive_group()
+
+    group.add_argument(
+        "-s",
+        "--server",
+        action="store_true",
+        help="Passive server mode (file receiver)",
+    )
+    group.add_argument(
+        "-c", "--client", action="store_true", help="Active client mode (file sender)"
     )
 
+    parser.add_argument("addr", help="Address or port. Format depends on mode.")
+    parser.add_argument("arg1", help="GAS (md5 mode) or input file (xfer mode)")
+    parser.add_argument("arg2", nargs="?", help="output file (only in xfer mode)")
+
+    args = parser.parse_args()
+
+    if args.server:
+        port = int(args.addr)
+        emulator = DCCNETEmulator(
+            ip="::",
+            port=port,
+            mode="xfer",
+            infile=args.arg1,
+            outfile=args.arg2,
+        )
+    elif args.client:
+        ip, port = parse_address(args.addr)
+        emulator = DCCNETEmulator(
+            ip=ip, port=port, mode="xfer", infile=args.arg1, outfile=args.arg2
+        )
+    else:
+        ip, port = parse_address(args.addr)
+        emulator = DCCNETEmulator(ip=ip, port=port, gas=args.arg1, mode="md5")
+
     emulator.start()
+
+
+if __name__ == "__main__":
+    main()

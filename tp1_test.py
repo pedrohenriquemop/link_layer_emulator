@@ -49,7 +49,7 @@ class TestDCCNET(unittest.TestCase):
 
     def test_empty_payload_with_end_flag(self):
         # Test a frame that has length 0 and END flag set
-        frame = DCCNETFrame(length=0, frame_id=0, flags=Flags.FLAG_END.value, data="")
+        frame = DCCNETFrame(length=0, frame_id=0, flags=Flags.FLAG_END, data="")
         packed = frame.pack()
         unpacked = DCCNETFrame.unpack(packed)
 
@@ -83,14 +83,14 @@ class TestDCCNET(unittest.TestCase):
 
     def test_with_no_data_payload_sent(self):
         # Simulate an ACK frame with no payload (length = 0)
-        frame = DCCNETFrame(length=0, frame_id=0, flags=Flags.FLAG_ACK.value)
+        frame = DCCNETFrame(length=0, frame_id=0, flags=Flags.FLAG_ACK)
         packed = frame.pack()
         unpacked = DCCNETFrame.unpack(packed)
 
         self.assertIsNotNone(unpacked)
         self.assertEqual(unpacked.length, 0)
         self.assertEqual(unpacked.frame_id, 0)
-        self.assertEqual(unpacked.flags, Flags.FLAG_ACK.value)
+        self.assertEqual(unpacked.flags, Flags.FLAG_ACK)
         self.assertEqual(unpacked.data, b"")
 
 
