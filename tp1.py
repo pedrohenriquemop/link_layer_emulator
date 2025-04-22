@@ -4,6 +4,8 @@ import hashlib
 import os
 import time
 from dotenv import load_dotenv
+from enum import Enum
+from typing import Optional
 
 # App Constants
 SYNC = 0xDCC023C2
@@ -16,10 +18,12 @@ RETRY_INTERVAL = 1
 
 CONNECTION_MAX_RETRIES = RETRY_LIMIT
 
+
 # Flags
-FLAG_ACK = 0x80
-FLAG_END = 0x40
-FLAG_RST = 0x20
+class Flags(Enum):
+    FLAG_ACK = 0x80
+    FLAG_END = 0x40
+    FLAG_RST = 0x20
 
 
 def compute_checksum(frame_bytes):
@@ -77,14 +81,14 @@ class DCCNETFrame:
     @classmethod
     def unpack(cls, frame_bytes):
         # minimum length for header: SYNC's (2 * 4 bytes) + checksum (2) + length (2) + frame_id (2) + flags (1)
-        if len(frame_bytes) < 15:
+        if len(frame_bytes) < HEADER_SIZE:
             raise ValueError("Frame too short to unpack")
         sync1, sync2, checksum, length, frame_id, flags = struct.unpack(
-            "!IIHHHB", frame_bytes[:15]
+            "!IIHHHB", frame_bytes[:HEADER_SIZE]
         )
         if sync1 != SYNC or sync2 != SYNC:
             raise ValueError("SYNC mismatch while unpacking frame")
-        data = frame_bytes[15 : 15 + length]
+        data = frame_bytes[HEADER_SIZE : HEADER_SIZE + length]
         # Verify checksum: compute over the whole frame with checksum field zeroed.
         frame_header_without_checksum = struct.pack(
             "!IIHHHB",
@@ -101,6 +105,71 @@ class DCCNETFrame:
         return cls(checksum, length, frame_id, flags, data)
 
 
+class DCCNETTransmitter:
+    def __init__(self, socket, mode="md5"):
+        self.socket = socket
+        self.mode = mode
+
+    def send_frame(self, frame: DCCNETFrame):
+        print(f"Transmitting frame [{frame.frame_id}]")
+        packed_frame = frame.pack()
+        self.socket.sendall(packed_frame)
+
+    def send_ack_frame(self, frame_id: int):
+        print(f"Transmitting ACK frame [{frame_id}]")
+        ack_frame = DCCNETFrame(
+            length=0,
+            frame_id=frame_id,
+            flags=Flags.FLAG_ACK.value,
+        )
+        self.send_frame(ack_frame)
+
+
+class DCCNETReceiver:
+    def __init__(self, socket, mode="md5"):
+        self.socket = socket
+        self.mode = mode
+
+    def receive_frame(self, retry=False) -> DCCNETFrame:
+        response_data: bytes = None
+
+        retry_amount = RETRY_LIMIT if retry else 1
+
+        for attempt in range(retry_amount):
+            print(f"Receiving frame ({attempt + 1}/{retry_amount})")
+            try:
+                response_data = self.socket.recv(MAX_FRAME_SIZE)
+                if not response_data:
+                    raise Exception("No data received")
+                break
+            except Exception:
+                print(f"Failed to receive ({attempt + 1}/{retry_amount})")
+                time.sleep(RETRY_INTERVAL)
+
+        return self.__get_frame_from_raw_data(response_data) if response_data else None
+
+    def __get_frame_from_raw_data(self, data: bytes) -> Optional[DCCNETFrame]:
+        data_aux = data
+        frame: Optional[DCCNETFrame] = None
+
+        while not frame and len(data_aux) >= HEADER_SIZE:
+            pos = data_aux.find(SYNC_BYTES)
+            potential_frame = data_aux[pos:]
+            frame = DCCNETFrame.unpack(potential_frame)
+
+            if (
+                frame is None
+                or pos == -1
+                or len(data_aux) - pos < HEADER_SIZE
+                or data_aux[pos + 4 : pos + 8] != SYNC_BYTES
+            ):
+                print("Incomplete or corrupted frame, tring to re-sync...")
+                data_aux = data_aux[pos + 8 :]
+                continue
+
+        return frame
+
+
 class DCCNETEmulator:
     def __init__(self, ip, port, gas=None, mode="md5", infile=None, outfile=None):
         self.ip = ip
@@ -109,6 +178,7 @@ class DCCNETEmulator:
         self.mode = mode  # 'md5' or 'xfer'
         self.infile = infile
         self.outfile = outfile
+        self.sock = None
         self.current_frame_id = 0
         self.last_recv_id = None
         self.last_recv_checksum = None
@@ -140,6 +210,9 @@ class DCCNETEmulator:
         if not self.try_connect():
             return
 
+        self.transmitter = DCCNETTransmitter(self.sock, self.mode)
+        self.receiver = DCCNETReceiver(self.sock, self.mode)
+
         formatted_gas = self.gas + "\n"
         gas_frame = DCCNETFrame(
             length=len(formatted_gas),
@@ -149,10 +222,10 @@ class DCCNETEmulator:
         )
 
         print("SENDING GAS frame")
-        self.send_frame_with_retransmit(gas_frame)
+        self.send_data_frame_with_retransmit(gas_frame)
 
         if self.mode == "md5":
-            self.receiver()
+            self.receiver_func()
 
         print("Closing connection...")
         self.sock.close()
@@ -160,32 +233,21 @@ class DCCNETEmulator:
     def toggle_frame_id(self):
         self.current_frame_id = 1 - self.current_frame_id
 
-    def send_ack_frame(self, frame_id: int):
-        print("SENDING ACK frame")
-        ack_frame = DCCNETFrame(
-            length=0,
-            frame_id=frame_id,
-            flags=FLAG_ACK,
-        )
-        self.sock.sendall(ack_frame.pack())
-
-    def send_frame_with_retransmit(self, frame: DCCNETFrame) -> DCCNETFrame:
-        packed = frame.pack()
+    def send_data_frame_with_retransmit(self, frame: DCCNETFrame) -> DCCNETFrame:
         ack_received = False
-        response_frame: DCCNETFrame
+        response_frame: DCCNETFrame = None
 
         for attempt in range(RETRY_LIMIT):
+            print(
+                f"Sending data frame [{frame.frame_id}] ({attempt + 1}/{RETRY_LIMIT})"
+            )
             try:
-                print(
-                    f"Transmitting frame [{frame.frame_id}] ({attempt + 1}/{RETRY_LIMIT})"
-                )
-                self.sock.sendall(packed)
-                response = self.sock.recv(MAX_FRAME_SIZE)
-                response_frame = self.get_frame_from_response(response)
+                self.transmitter.send_frame(frame)
+                response_frame = self.receiver.receive_frame()
                 if response_frame is None:
                     print("No response received")
                     continue
-                if response_frame.flags & FLAG_ACK:
+                if response_frame.flags & Flags.FLAG_ACK.value:
                     if response_frame.frame_id == frame.frame_id:
                         print(f"ACK received for frame [{frame.frame_id}]")
                         ack_received = True
@@ -200,81 +262,34 @@ class DCCNETEmulator:
                     print(f"Unexpected frame type received.")
                     time.sleep(RETRY_INTERVAL)
                     continue
-            except (socket.timeout, socket.error, Exception):
-                print(f"Failed transmission.")
+            except Exception as e:
+                print(f"Failed transmission: {e}")
+                time.sleep(RETRY_INTERVAL)
 
-        if not self.stop_flag and not ack_received:
+        if not ack_received:
             self.stop_flag = True
             raise ValueError("Transmission failed after maximum retries.")
 
         return response_frame
 
-    def get_frame_from_response(self, response_data: bytes) -> DCCNETFrame:
-        if not response_data:
-            raise ValueError("Empty response received")
-
-        # TODO: create function to check for SYNC pattern
-        pos = response_data.find(SYNC_BYTES)
-        if (
-            pos == -1
-            or len(response_data) - pos < 15
-            or response_data[pos + 4 : pos + 8] != SYNC_BYTES
-        ):
-            raise ValueError("Invalid response received: no SYNC pattern found")
-
-        return DCCNETFrame.unpack(response_data[pos:])
-
-    def receiver(self):
+    def receiver_func(self):
         message_buffer = ""
         while not self.stop_flag:
             try:
-                data = None
-                for attempt in range(RETRY_LIMIT):
-                    try:
-                        data = self.sock.recv(MAX_FRAME_SIZE)
-                        if not data:
-                            raise Exception("Missing data")
-                        break
-                    except Exception:
-                        print(
-                            f"Failed to receive: Attempt {attempt + 1} of {RETRY_LIMIT}"
-                        )
-                        time.sleep(RETRY_INTERVAL)
-
-                print("--- after recv retries")
-
-                # TODO: create function to check for SYNC pattern
-                frame: DCCNETFrame = None
-                while not frame and len(data) >= 15:
-                    pos = data.find(SYNC_BYTES)
-                    if (
-                        pos == -1
-                        or len(data) - pos < 15
-                        or data[pos + 4 : pos + 8] != SYNC_BYTES
-                    ):
-                        print("Two syncs not found, tring to re-sync...")
-                        data = data[pos + 8 :]
-                        continue
-
-                    potential_frame = data[pos:]
-                    frame = DCCNETFrame.unpack(potential_frame)
-                    if frame is None:
-                        print("Incomplete or corrupted frame, tring to re-sync...")
-                        data = data[pos + 8 :]
-                        continue
+                frame = self.receiver.receive_frame(retry=True)
 
                 if not frame:
                     print("No frame found, SYNC failed.")
-                    continue
+                    break
 
-                if frame.flags & FLAG_ACK:
+                if frame.flags & Flags.FLAG_ACK.value:
                     print("ACK frame received out of order")
                     continue
-                elif frame.flags & FLAG_RST:
+                elif frame.flags & Flags.FLAG_RST.value:
                     print("Reset frame received. Shutting down connection.")
                     self.stop_flag = True
                     break
-                elif frame.flags & FLAG_END:
+                elif frame.flags & Flags.FLAG_END.value:
                     print("End frame received. For now, will be treated as a data one.")
                     self.stop_flag = True
                 else:
@@ -285,15 +300,14 @@ class DCCNETEmulator:
                     and self.last_recv_checksum == frame.checksum
                 ):
                     print("Duplicate frame received. Re-sending ACK...")
-                    self.send_ack_frame(frame.frame_id)
+                    self.transmitter.send_ack_frame(frame.frame_id)
                     continue
 
-                self.send_ack_frame(frame.frame_id)
+                self.transmitter.send_ack_frame(frame.frame_id)
                 self.last_recv_id = frame.frame_id
                 self.last_recv_checksum = frame.checksum
 
                 if self.mode == "md5":
-                    # In MD5 mode, accumulate data until a newline is found.
                     text = frame.data.decode("ascii", errors="ignore")
                     message_buffer += text
                     print("message buffer:", message_buffer)
@@ -310,7 +324,7 @@ class DCCNETEmulator:
                                     flags=0,
                                     data=md5_frame_data,
                                 )
-                                self.send_frame_with_retransmit(md5_frame)
+                                self.send_data_frame_with_retransmit(md5_frame)
                         # elif self.mode == "xfer":
                         #     TODO: write the data to the output file
                         message_buffer = message_buffer.split("\n")[-1]
@@ -321,32 +335,33 @@ class DCCNETEmulator:
                 traceback.print_exc()
                 continue
 
-    def transmitter(self):
-        if self.mode == "md5":
-            # In MD5 mode, no data is sent from our side except the authentication and MD5 responses.
-            return
-        elif self.mode == "xfer":
-            # For file transfer, read file and send in frames
-            with open(self.infile, "rb") as f:
-                while True:
-                    chunk = f.read(MAX_FRAME_SIZE)
-                    if not chunk:
-                        # Send an empty frame with END flag set to signal end-of-transmission
-                        frame = DCCNETFrame(
-                            length=0, frame_id=self.current_frame_id, flags=FLAG_END
-                        )
-                        self.send_frame_with_retransmit(frame)
-                        break
-                    # Build and send frame
-                    frame = DCCNETFrame(
-                        length=len(chunk),
-                        frame_id=self.current_frame_id,
-                        flags=0,
-                        data=chunk,
-                    )
-                    self.send_frame_with_retransmit(frame)
-                    # Toggle frame id for next frame
-                    self.current_frame_id = 1 - self.current_frame_id
+    # def transmitter_func(self):
+    #     if self.mode == "md5":
+    #         # In MD5 mode, no data is sent from our side except the authentication and MD5 responses.
+    #         return
+    #     elif self.mode == "xfer":
+    #         # For file transfer, read file and send in frames
+    #         with open(self.infile, "rb") as f:
+    #             while True:
+    #                 chunk = f.read(MAX_FRAME_SIZE)
+    #                 if not chunk:
+    #                     frame = DCCNETFrame(
+    #                         length=0,
+    #                         frame_id=self.current_frame_id,
+    #                         flags=Flags.FLAG_END.value,
+    #                     )
+    #                     self.send_frame_with_retransmit(frame)
+    #                     break
+    #                 # Build and send frame
+    #                 frame = DCCNETFrame(
+    #                     length=len(chunk),
+    #                     frame_id=self.current_frame_id,
+    #                     flags=0,
+    #                     data=chunk,
+    #                 )
+    #                 self.send_frame_with_retransmit(frame)
+    #                 # Toggle frame id for next frame
+    #                 self.current_frame_id = 1 - self.current_frame_id
 
 
 if __name__ == "__main__":
