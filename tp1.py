@@ -1,12 +1,14 @@
 import struct
 import socket
 import hashlib
-import os
 import time
 import argparse
-from dotenv import load_dotenv
 from enum import IntEnum
-from typing import Optional
+from typing import Optional, Literal
+
+import asyncio
+from pathlib import Path
+import aiofiles
 
 # App Constants
 SYNC = 0xDCC023C2
@@ -27,57 +29,43 @@ class Flags(IntEnum):
     FLAG_RST = 0x20
 
 
-def compute_checksum(frame_bytes):
-    b = bytearray(frame_bytes)
-    b[8:10] = b"\x00\x00"
-    s = 0
+class Utils:
+    @staticmethod
+    def compute_checksum(frame_bytes: bytes) -> int:
+        b = bytearray(frame_bytes)
+        b[8:10] = b"\x00\x00"
+        s = 0
+        for i in range(0, len(b), 2):
+            word = b[i] << 8 | (b[i + 1] if i + 1 < len(b) else 0)
+            s += word
+            s = (s & 0xFFFF) + (s >> 16)
+        return ~s & 0xFFFF
 
-    for i in range(0, len(b), 2):
-        if i + 1 < len(b):
-            word = b[i] << 8 | b[i + 1]
-        else:
-            word = b[i] << 8
-        s += word
-        s = (s & 0xFFFF) + (s >> 16)
-    return ~s & 0xFFFF
+    @staticmethod
+    def parse_address(ip_port: str):
+        if ":" not in ip_port:
+            raise ValueError("Expected format <IP>:<PORT>")
+        ip, port = ip_port.rsplit(":", 1)
+        return ip, int(port)
 
 
 class DCCNETFrame:
-    def __init__(self, checksum=0, length=0, frame_id=0, flags=0, data=b""):
-        self.sync = SYNC
-        self.checksum = checksum
+    def __init__(self, length=0, frame_id=0, flags=0, data=b"", checksum=0):
         self.length = length
         self.frame_id = frame_id
         self.flags = flags
         self.data = data
+        self.checksum = checksum
 
     def pack(self):
-        header_with_zeroed_checksum = struct.pack(
-            "!IIHHHB",
-            self.sync,
-            self.sync,
-            0,
-            self.length,
-            self.frame_id,
-            self.flags,
-        )
-
-        data_as_bytes = bytes(self.data, encoding="ascii") if self.data else b""
-
-        if len(data_as_bytes) > MAX_PAYLOAD:
-            raise ValueError("Data exceeds maximum payload size")
-
-        self.checksum = compute_checksum(header_with_zeroed_checksum + data_as_bytes)
         header = struct.pack(
-            "!IIHHHB",
-            self.sync,
-            self.sync,
-            self.checksum,
-            self.length,
-            self.frame_id,
-            self.flags,
+            "!IIHHHB", SYNC, SYNC, 0, self.length, self.frame_id, self.flags
         )
-        return header + data_as_bytes
+        self.checksum = Utils.compute_checksum(header + self.data)
+        header = struct.pack(
+            "!IIHHHB", SYNC, SYNC, self.checksum, self.length, self.frame_id, self.flags
+        )
+        return header + self.data
 
     @classmethod
     def unpack(cls, frame_bytes):
@@ -100,16 +88,15 @@ class DCCNETFrame:
             frame_id,
             flags,
         )
-        computed = compute_checksum(frame_header_without_checksum + data)
+        computed = Utils.compute_checksum(frame_header_without_checksum + data)
         if computed != checksum:
             raise ValueError("Checksum mismatch while unpacking frame")
-        return cls(checksum, length, frame_id, flags, data)
+        return cls(length, frame_id, flags, data, checksum)
 
 
 class DCCNETTransmitter:
-    def __init__(self, socket, mode="md5"):
+    def __init__(self, socket):
         self.socket = socket
-        self.mode = mode
 
     def send_frame(self, frame: DCCNETFrame):
         print(f"Transmitting frame [{frame.frame_id}]")
@@ -127,9 +114,8 @@ class DCCNETTransmitter:
 
 
 class DCCNETReceiver:
-    def __init__(self, socket, mode="md5"):
+    def __init__(self, socket):
         self.socket = socket
-        self.mode = mode
 
     def receive_frame(self, retry=False) -> DCCNETFrame:
         response_data: bytes = None
@@ -171,14 +157,12 @@ class DCCNETReceiver:
         return frame
 
 
-class DCCNETEmulator:
-    def __init__(self, ip, port, gas=None, mode="md5", infile=None, outfile=None):
+class DCCNETEmulatorMd5:
+    def __init__(self, ip, port, gas=None):
         self.ip = ip
         self.port = port
         self.gas = gas
-        self.mode = mode  # 'md5' or 'xfer'
-        self.infile = infile
-        self.outfile = outfile
+
         self.sock = None
         self.current_frame_id = 0
         self.last_recv_id = None
@@ -211,8 +195,8 @@ class DCCNETEmulator:
         if not self.try_connect():
             return
 
-        self.transmitter = DCCNETTransmitter(self.sock, self.mode)
-        self.receiver = DCCNETReceiver(self.sock, self.mode)
+        self.transmitter = DCCNETTransmitter(self.sock)
+        self.receiver = DCCNETReceiver(self.sock)
 
         formatted_gas = self.gas + "\n"
         gas_frame = DCCNETFrame(
@@ -225,8 +209,7 @@ class DCCNETEmulator:
         print("SENDING GAS frame")
         self.send_data_frame_with_retransmit(gas_frame)
 
-        if self.mode == "md5":
-            self.receiver_func()
+        self.receiver_func()
 
         print("Closing connection...")
         self.sock.close()
@@ -308,27 +291,25 @@ class DCCNETEmulator:
                 self.last_recv_id = frame.frame_id
                 self.last_recv_checksum = frame.checksum
 
-                if self.mode == "md5":
-                    text = frame.data.decode("ascii", errors="ignore")
-                    message_buffer += text
-                    print("message buffer:", message_buffer)
+                text = frame.data.decode("ascii", errors="ignore")
+                message_buffer += text
+                print("message buffer:", message_buffer)
 
-                    if message_buffer.find("\n") != -1:
-                        lines = message_buffer.split("\n")[:-1]
-                        for line in lines:
-                            if line:
-                                md5_hash = hashlib.md5(line.encode("ascii")).hexdigest()
-                                md5_frame_data = md5_hash + "\n"
-                                md5_frame = DCCNETFrame(
-                                    length=len(md5_frame_data),
-                                    frame_id=self.current_frame_id,
-                                    flags=0,
-                                    data=md5_frame_data,
-                                )
-                                self.send_data_frame_with_retransmit(md5_frame)
-                        # elif self.mode == "xfer":
-                        #     TODO: write the data to the output file
-                        message_buffer = message_buffer.split("\n")[-1]
+                if message_buffer.find("\n") != -1:
+                    lines = message_buffer.split("\n")[:-1]
+                    for line in lines:
+                        if line:
+                            md5_hash = hashlib.md5(line.encode("ascii")).hexdigest()
+                            md5_frame_data = md5_hash + "\n"
+                            md5_frame = DCCNETFrame(
+                                length=len(md5_frame_data),
+                                frame_id=self.current_frame_id,
+                                flags=0,
+                                data=md5_frame_data,
+                            )
+                            self.send_data_frame_with_retransmit(md5_frame)
+
+                    message_buffer = message_buffer.split("\n")[-1]
             except Exception as e:
                 print("[receiver] Exception:", e)
                 import traceback
@@ -336,40 +317,188 @@ class DCCNETEmulator:
                 traceback.print_exc()
                 continue
 
-    # def transmitter_func(self):
-    #     if self.mode == "md5":
-    #         # In MD5 mode, no data is sent from our side except the authentication and MD5 responses.
-    #         return
-    #     elif self.mode == "xfer":
-    #         # For file transfer, read file and send in frames
-    #         with open(self.infile, "rb") as f:
-    #             while True:
-    #                 chunk = f.read(MAX_FRAME_SIZE)
-    #                 if not chunk:
-    #                     frame = DCCNETFrame(
-    #                         length=0,
-    #                         frame_id=self.current_frame_id,
-    #                         flags=Flags.FLAG_END,
-    #                     )
-    #                     self.send_frame_with_retransmit(frame)
-    #                     break
-    #                 # Build and send frame
-    #                 frame = DCCNETFrame(
-    #                     length=len(chunk),
-    #                     frame_id=self.current_frame_id,
-    #                     flags=0,
-    #                     data=chunk,
-    #                 )
-    #                 self.send_frame_with_retransmit(frame)
-    #                 # Toggle frame id for next frame
-    #                 self.current_frame_id = 1 - self.current_frame_id
 
+class DCCNETEmulatorXfer:
+    def __init__(
+        self,
+        ip: None,
+        port,
+        mode: Literal["server", "client"],
+        infile=None,
+        outfile=None,
+    ):
+        self.ip = ip
+        self.port = port
+        self.mode = mode
+        self.infile = infile
+        self.outfile = outfile
 
-def parse_address(ip_port: str):
-    if ":" not in ip_port:
-        raise ValueError("Expected format <IP>:<PORT>")
-    ip, port = ip_port.split(":", 1)
-    return ip, int(port)
+    def start(self):
+        if self.mode == "server":
+            asyncio.run(self.__run_server(self.port, self.infile, self.outfile))
+        elif self.mode == "client":
+            asyncio.run(
+                self.__run_client(self.ip, self.port, self.infile, self.outfile)
+            )
+
+    async def __reader_loop(
+        self, reader: asyncio.StreamReader, frame_queue: asyncio.Queue
+    ):
+        buffer = b""
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while True:
+                pos = buffer.find(SYNC_BYTES)
+                if pos < 0 or len(buffer) - pos < HEADER_SIZE:
+                    break
+                if buffer[pos + 4 : pos + 8] != SYNC_BYTES:
+                    buffer = buffer[pos + 1 :]
+                    continue
+                length = struct.unpack("!H", buffer[pos + 10 : pos + 12])[0]
+                total = HEADER_SIZE + length
+                if len(buffer) - pos < total:
+                    break
+                raw = buffer[pos : pos + total]
+                buffer = buffer[pos + total :]
+                frame = DCCNETFrame.unpack(raw)
+                if frame:
+                    await frame_queue.put(frame)
+
+    async def __demux(self, frame_queue, ack_queue, data_queue):
+        while True:
+            frame = await frame_queue.get()
+            if frame.flags & Flags.FLAG_ACK:
+                await ack_queue.put(frame)
+            else:
+                await data_queue.put(frame)
+
+    async def __send_file(
+        self, writer: asyncio.StreamWriter, ack_queue: asyncio.Queue, infile: Path
+    ) -> None:
+        frame_id = 0
+        async with aiofiles.open(infile, "rb") as f:
+            while True:
+                chunk = await f.read(MAX_PAYLOAD)
+                is_last = not chunk
+                data = chunk if chunk else b""
+                flags = Flags.FLAG_END if is_last else 0
+
+                frame = DCCNETFrame(
+                    length=len(data), frame_id=frame_id, flags=flags, data=data
+                )
+                print(
+                    f"[SEND] Frame ID={frame_id}, len={len(data)}, END={bool(flags & Flags.FLAG_END)}"
+                )
+
+                retry = 0
+                while retry < RETRY_LIMIT:
+                    writer.write(frame.pack())
+                    await writer.drain()
+                    await asyncio.sleep(0)
+
+                    try:
+                        ack = await asyncio.wait_for(
+                            ack_queue.get(), timeout=RETRY_INTERVAL * 2
+                        )
+                        if ack.frame_id == frame_id:
+                            print(f"[SEND] ACK received for frame {frame_id}")
+                            break
+                        else:
+                            print(
+                                f"[SEND] Unexpected ACK (got {ack.frame_id}, expected {frame_id})"
+                            )
+                    except asyncio.TimeoutError:
+                        retry += 1
+                        print(
+                            f"[SEND] Timeout waiting for ACK (retry {retry}/{RETRY_LIMIT})"
+                        )
+
+                if retry == RETRY_LIMIT:
+                    raise Exception(f"Max retries reached for frame {frame_id}")
+
+                if is_last:
+                    print("[SEND] All data sent and END acknowledged")
+                    break
+
+                frame_id ^= 1
+
+    async def __recv_file(
+        self, writer: asyncio.StreamWriter, data_queue: asyncio.Queue, outfile: Path
+    ) -> None:
+        last_id = None
+        last_checksum = None
+        async with aiofiles.open(outfile, "ab") as f:
+            while True:
+                frame = await data_queue.get()
+                print(
+                    f"[RECV] Frame ID={frame.frame_id}, len={len(frame.data)}, END={bool(frame.flags & Flags.FLAG_END)}"
+                )
+
+                if frame.frame_id == last_id and frame.checksum == last_checksum:
+                    print(f"[RECV] Duplicate frame {frame.frame_id}, resending ACK")
+                    ack = DCCNETFrame(
+                        length=0, frame_id=frame.frame_id, flags=Flags.FLAG_ACK
+                    )
+                    writer.write(ack.pack())
+                    await writer.drain()
+                    await asyncio.sleep(0)
+                    continue
+
+                await f.write(frame.data)
+                ack = DCCNETFrame(
+                    length=0, frame_id=frame.frame_id, flags=Flags.FLAG_ACK
+                )
+                writer.write(ack.pack())
+                await writer.drain()
+                await asyncio.sleep(0)
+                print(f"[RECV] ACK sent for frame {frame.frame_id}")
+
+                if frame.flags & Flags.FLAG_END:
+                    print(f"[RECV] END frame received and acknowledged")
+                    break
+
+                last_id = frame.frame_id
+                last_checksum = frame.checksum
+
+    async def __handle_connection(self, reader, writer, infile, outfile):
+        frame_queue = asyncio.Queue()
+        ack_queue = asyncio.Queue()
+        data_queue = asyncio.Queue()
+
+        reader_task = asyncio.create_task(self.__reader_loop(reader, frame_queue))
+        demux_task = asyncio.create_task(
+            self.__demux(frame_queue, ack_queue, data_queue)
+        )
+        send_task = asyncio.create_task(
+            self.__send_file(writer, ack_queue, Path(infile))
+        )
+        recv_task = asyncio.create_task(
+            self.__recv_file(writer, data_queue, Path(outfile))
+        )
+
+        await asyncio.gather(send_task, recv_task)
+
+        demux_task.cancel()
+        reader_task.cancel()
+
+        writer.close()
+        await writer.wait_closed()
+
+    async def __run_server(self, port: int, infile: str, outfile: str):
+        async def handler(reader, writer):
+            await self.__handle_connection(reader, writer, infile, outfile)
+
+        server = await asyncio.start_server(handler, host="127.0.0.1", port=port)
+        print(f"[INFO] Servidor ouvindo na porta {port}...")
+        async with server:
+            await server.serve_forever()
+
+    async def __run_client(self, ip: str, port: int, infile: str, outfile: str):
+        reader, writer = await asyncio.open_connection(ip, port)
+        await self.__handle_connection(reader, writer, infile, outfile)
 
 
 def main():
@@ -394,21 +523,17 @@ def main():
 
     if args.server:
         port = int(args.addr)
-        emulator = DCCNETEmulator(
-            ip="::",
-            port=port,
-            mode="xfer",
-            infile=args.arg1,
-            outfile=args.arg2,
+        emulator = DCCNETEmulatorXfer(
+            ip=None, port=port, mode="server", infile=args.arg1, outfile=args.arg2
         )
     elif args.client:
-        ip, port = parse_address(args.addr)
-        emulator = DCCNETEmulator(
-            ip=ip, port=port, mode="xfer", infile=args.arg1, outfile=args.arg2
+        ip, port = Utils.parse_address(args.addr)
+        emulator = DCCNETEmulatorXfer(
+            ip=ip, port=port, mode="client", infile=args.arg1, outfile=args.arg2
         )
     else:
-        ip, port = parse_address(args.addr)
-        emulator = DCCNETEmulator(ip=ip, port=port, gas=args.arg1, mode="md5")
+        ip, port = Utils.parse_address(args.addr)
+        emulator = DCCNETEmulatorMd5(ip=ip, port=port, gas=args.arg1)
 
     emulator.start()
 

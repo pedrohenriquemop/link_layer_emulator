@@ -4,4 +4,14 @@ __pycache__/
 *.pyc
 .pytest_cache
 *.pdf
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.svg
+*.tiff
+*.bmp
+*.txt
+*.sh
 .vscode
