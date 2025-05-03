@@ -518,7 +518,7 @@ class DCCNETEmulatorXfer:
             print(f"[INFO] Nova conexão recebida")
             await self.__handle_connection(reader, writer, infile, outfile)
 
-        server = await asyncio.start_server(handler, host="127.0.0.1", port=port)
+        server = await asyncio.start_server(handler, host="::", port=port)
         print(f"[INFO] Servidor ouvindo na porta {port}...")
         async with server:
             await server.serve_forever()
