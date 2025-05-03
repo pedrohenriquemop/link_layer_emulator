@@ -1,6 +1,7 @@
 import struct
 import socket
 import hashlib
+import sys
 import time
 import argparse
 from enum import IntEnum
@@ -20,6 +21,8 @@ RETRY_LIMIT = 16
 RETRY_INTERVAL = 1
 
 CONNECTION_MAX_RETRIES = RETRY_LIMIT
+
+THROTTLE_DELAY = 0.05  # Seconds. Used to simulate network delay.
 
 
 # Flags
@@ -334,134 +337,155 @@ class DCCNETEmulatorXfer:
         self.outfile = outfile
 
     def start(self):
-        if self.mode == "server":
-            asyncio.run(self.__run_server(self.port, self.infile, self.outfile))
-        elif self.mode == "client":
-            asyncio.run(
-                self.__run_client(self.ip, self.port, self.infile, self.outfile)
-            )
+        try:
+            if self.mode == "server":
+                asyncio.run(self.__run_server(self.port, self.infile, self.outfile))
+            elif self.mode == "client":
+                asyncio.run(
+                    self.__run_client(self.ip, self.port, self.infile, self.outfile)
+                )
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
 
     async def __reader_loop(
         self, reader: asyncio.StreamReader, frame_queue: asyncio.Queue
     ):
         buffer = b""
-        while True:
-            chunk = await reader.read(4096)
-            if not chunk:
-                break
-            buffer += chunk
+        try:
             while True:
-                pos = buffer.find(SYNC_BYTES)
-                if pos < 0 or len(buffer) - pos < HEADER_SIZE:
+                chunk = await reader.read(4096)
+                if not chunk:
                     break
-                if buffer[pos + 4 : pos + 8] != SYNC_BYTES:
-                    buffer = buffer[pos + 1 :]
-                    continue
-                length = struct.unpack("!H", buffer[pos + 10 : pos + 12])[0]
-                total = HEADER_SIZE + length
-                if len(buffer) - pos < total:
-                    break
-                raw = buffer[pos : pos + total]
-                buffer = buffer[pos + total :]
-                frame = DCCNETFrame.unpack(raw)
-                if frame:
-                    await frame_queue.put(frame)
+                buffer += chunk
+                while True:
+                    pos = buffer.find(SYNC_BYTES)
+                    if pos < 0 or len(buffer) - pos < HEADER_SIZE:
+                        break
+                    if buffer[pos + 4 : pos + 8] != SYNC_BYTES:
+                        buffer = buffer[pos + 1 :]
+                        continue
+                    length = struct.unpack("!H", buffer[pos + 10 : pos + 12])[0]
+                    total = HEADER_SIZE + length
+                    if len(buffer) - pos < total:
+                        break
+                    raw = buffer[pos : pos + total]
+                    buffer = buffer[pos + total :]
+                    try:
+                        frame = DCCNETFrame.unpack(raw)
+                        if frame:
+                            await frame_queue.put(frame)
+                    except Exception as e:
+                        print(f"[WARN] Frame parse error: {e}")
+        except Exception as e:
+            print(f"[ERROR] Reader loop failed: {e}")
 
     async def __demux(self, frame_queue, ack_queue, data_queue):
-        while True:
-            frame = await frame_queue.get()
-            if frame.flags & Flags.FLAG_ACK:
-                await ack_queue.put(frame)
-            else:
-                await data_queue.put(frame)
+        try:
+            while True:
+                frame = await frame_queue.get()
+                if frame.flags & Flags.FLAG_ACK:
+                    await ack_queue.put(frame)
+                else:
+                    await data_queue.put(frame)
+        except asyncio.CancelledError:
+            pass
 
     async def __send_file(
         self, writer: asyncio.StreamWriter, ack_queue: asyncio.Queue, infile: Path
-    ) -> None:
+    ):
         frame_id = 0
-        async with aiofiles.open(infile, "rb") as f:
-            while True:
-                chunk = await f.read(MAX_PAYLOAD)
-                is_last = not chunk
-                data = chunk if chunk else b""
-                flags = Flags.FLAG_END if is_last else 0
+        try:
+            async with aiofiles.open(infile, "rb") as f:
+                while True:
+                    chunk = await f.read(MAX_PAYLOAD)
+                    is_last = not chunk
+                    data = chunk if chunk else b""
+                    flags = Flags.FLAG_END if is_last else 0
 
-                frame = DCCNETFrame(
-                    length=len(data), frame_id=frame_id, flags=flags, data=data
-                )
-                print(
-                    f"[SEND] Frame ID={frame_id}, len={len(data)}, END={bool(flags & Flags.FLAG_END)}"
-                )
+                    frame = DCCNETFrame(
+                        length=len(data), frame_id=frame_id, flags=flags, data=data
+                    )
+                    print(
+                        f"[SEND] Frame ID={frame_id}, len={len(data)}, END={bool(flags & Flags.FLAG_END)}"
+                    )
 
-                retry = 0
-                while retry < RETRY_LIMIT:
-                    writer.write(frame.pack())
-                    await writer.drain()
-                    await asyncio.sleep(0)
+                    retry = 0
+                    while retry < RETRY_LIMIT:
+                        writer.write(frame.pack())
+                        await writer.drain()
+                        await asyncio.sleep(THROTTLE_DELAY)
 
-                    try:
-                        ack = await asyncio.wait_for(
-                            ack_queue.get(), timeout=RETRY_INTERVAL * 2
-                        )
-                        if ack.frame_id == frame_id:
-                            print(f"[SEND] ACK received for frame {frame_id}")
-                            break
-                        else:
-                            print(
-                                f"[SEND] Unexpected ACK (got {ack.frame_id}, expected {frame_id})"
+                        try:
+                            ack = await asyncio.wait_for(
+                                ack_queue.get(), timeout=RETRY_INTERVAL * 2
                             )
-                    except asyncio.TimeoutError:
-                        retry += 1
-                        print(
-                            f"[SEND] Timeout waiting for ACK (retry {retry}/{RETRY_LIMIT})"
-                        )
+                            if ack.frame_id == frame_id:
+                                print(f"[SEND] ACK received for frame {frame_id}")
+                                break
+                            else:
+                                print(
+                                    f"[WARN] Unexpected ACK (got {ack.frame_id}, expected {frame_id})"
+                                )
+                        except asyncio.TimeoutError:
+                            retry += 1
+                            print(
+                                f"[RETRY] Timeout waiting for ACK (retry {retry}/{RETRY_LIMIT})"
+                            )
 
-                if retry == RETRY_LIMIT:
-                    raise Exception(f"Max retries reached for frame {frame_id}")
+                    if retry == RETRY_LIMIT:
+                        raise Exception(f"Max retries reached for frame {frame_id}")
 
-                if is_last:
-                    print("[SEND] All data sent and END acknowledged")
-                    break
+                    if is_last:
+                        print("[SEND] All data sent and END acknowledged")
+                        break
 
-                frame_id ^= 1
+                    frame_id ^= 1
+        except Exception as e:
+            print(f"[ERROR] Sending failed: {e}")
+            raise
 
     async def __recv_file(
         self, writer: asyncio.StreamWriter, data_queue: asyncio.Queue, outfile: Path
-    ) -> None:
+    ):
         last_id = None
         last_checksum = None
-        async with aiofiles.open(outfile, "ab") as f:
-            while True:
-                frame = await data_queue.get()
-                print(
-                    f"[RECV] Frame ID={frame.frame_id}, len={len(frame.data)}, END={bool(frame.flags & Flags.FLAG_END)}"
-                )
+        try:
+            async with aiofiles.open(outfile, "ab") as f:
+                while True:
+                    frame = await data_queue.get()
+                    print(
+                        f"[RECV] Frame ID={frame.frame_id}, len={len(frame.data)}, END={bool(frame.flags & Flags.FLAG_END)}"
+                    )
 
-                if frame.frame_id == last_id and frame.checksum == last_checksum:
-                    print(f"[RECV] Duplicate frame {frame.frame_id}, resending ACK")
+                    if frame.frame_id == last_id and frame.checksum == last_checksum:
+                        print(f"[RECV] Duplicate frame {frame.frame_id}, resending ACK")
+                        ack = DCCNETFrame(
+                            length=0, frame_id=frame.frame_id, flags=Flags.FLAG_ACK
+                        )
+                        writer.write(ack.pack())
+                        await writer.drain()
+                        await asyncio.sleep(THROTTLE_DELAY)
+                        continue
+
+                    await f.write(frame.data)
                     ack = DCCNETFrame(
                         length=0, frame_id=frame.frame_id, flags=Flags.FLAG_ACK
                     )
                     writer.write(ack.pack())
                     await writer.drain()
-                    await asyncio.sleep(0)
-                    continue
+                    await asyncio.sleep(THROTTLE_DELAY)
+                    print(f"[RECV] ACK sent for frame {frame.frame_id}")
 
-                await f.write(frame.data)
-                ack = DCCNETFrame(
-                    length=0, frame_id=frame.frame_id, flags=Flags.FLAG_ACK
-                )
-                writer.write(ack.pack())
-                await writer.drain()
-                await asyncio.sleep(0)
-                print(f"[RECV] ACK sent for frame {frame.frame_id}")
+                    if frame.flags & Flags.FLAG_END:
+                        print(f"[RECV] END frame received and acknowledged")
+                        break
 
-                if frame.flags & Flags.FLAG_END:
-                    print(f"[RECV] END frame received and acknowledged")
-                    break
-
-                last_id = frame.frame_id
-                last_checksum = frame.checksum
+                    last_id = frame.frame_id
+                    last_checksum = frame.checksum
+        except Exception as e:
+            print(f"[ERROR] Receiving failed: {e}")
+            raise
 
     async def __handle_connection(self, reader, writer, infile, outfile):
         frame_queue = asyncio.Queue()
@@ -479,16 +503,19 @@ class DCCNETEmulatorXfer:
             self.__recv_file(writer, data_queue, Path(outfile))
         )
 
-        await asyncio.gather(send_task, recv_task)
-
-        demux_task.cancel()
-        reader_task.cancel()
-
-        writer.close()
-        await writer.wait_closed()
+        try:
+            await asyncio.gather(send_task, recv_task)
+        except Exception:
+            print("[ERROR] File transfer failed")
+        finally:
+            demux_task.cancel()
+            reader_task.cancel()
+            writer.close()
+            await writer.wait_closed()
 
     async def __run_server(self, port: int, infile: str, outfile: str):
         async def handler(reader, writer):
+            print(f"[INFO] Nova conexão recebida")
             await self.__handle_connection(reader, writer, infile, outfile)
 
         server = await asyncio.start_server(handler, host="127.0.0.1", port=port)
@@ -497,8 +524,12 @@ class DCCNETEmulatorXfer:
             await server.serve_forever()
 
     async def __run_client(self, ip: str, port: int, infile: str, outfile: str):
-        reader, writer = await asyncio.open_connection(ip, port)
-        await self.__handle_connection(reader, writer, infile, outfile)
+        try:
+            reader, writer = await asyncio.open_connection(ip, port)
+            await self.__handle_connection(reader, writer, infile, outfile)
+        except Exception as e:
+            print(f"[ERROR] Falha ao conectar-se ao servidor: {e}")
+            raise
 
 
 def main():
