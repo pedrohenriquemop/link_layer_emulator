@@ -203,7 +203,7 @@ class DCCNETEmulatorMd5:
             length=len(formatted_gas),
             frame_id=self.current_frame_id,
             flags=0,
-            data=formatted_gas,
+            data=formatted_gas.encode("ascii"),
         )
 
         print("SENDING GAS frame")
@@ -300,7 +300,7 @@ class DCCNETEmulatorMd5:
                     for line in lines:
                         if line:
                             md5_hash = hashlib.md5(line.encode("ascii")).hexdigest()
-                            md5_frame_data = md5_hash + "\n"
+                            md5_frame_data = (md5_hash + "\n").encode("ascii")
                             md5_frame = DCCNETFrame(
                                 length=len(md5_frame_data),
                                 frame_id=self.current_frame_id,
